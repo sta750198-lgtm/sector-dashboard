@@ -6,6 +6,8 @@ Run with: streamlit run app.py
 Author: Haseeb Ashraf
 """
 
+import time
+
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -113,8 +115,27 @@ st_autorefresh(interval=DATA_REFRESH_SECONDS * 1000, key="auto_refresh_timer")
 # -----------------------------------------------------------------
 @st.cache_data(ttl=DATA_REFRESH_SECONDS)
 def pull_price_data(tickers, period):
-    raw = yf.download(tickers, period=period, progress=False)
-    return raw["Close"]
+    # Yahoo Finance occasionally rate-limits requests coming from shared
+    # cloud hosts (like Streamlit Community Cloud) and silently returns an
+    # empty table instead of an error. Retrying a couple of times with a
+    # short pause clears this up almost every time; if it still fails we
+    # raise so the caller can show a clear message instead of crashing on
+    # a downstream "empty dataframe" error.
+    last_error = None
+    for attempt in range(3):
+        try:
+            raw = yf.download(tickers, period=period, progress=False, threads=False)
+            close_prices = raw["Close"]
+            if not close_prices.empty and len(close_prices) > 5:
+                return close_prices
+        except Exception as exc:  # noqa: BLE001 - any failure just triggers a retry
+            last_error = exc
+        if attempt < 2:
+            time.sleep(3)
+    raise RuntimeError(
+        "Yahoo Finance returned no data after 3 attempts - it's likely "
+        "rate-limiting this server."
+    ) from last_error
 
 
 def compute_daily_returns(close_prices):
@@ -297,9 +318,26 @@ with badge_col:
 all_tickers = list(SECTOR_ETFS.keys()) + [BENCHMARK]
 labels = {**SECTOR_ETFS, BENCHMARK: "S&P 500 (SPY)"}
 
-with st.spinner("Pulling market data..."):
-    close_prices = pull_price_data(all_tickers, lookback)
-    daily_returns = compute_daily_returns(close_prices)
+try:
+    with st.spinner("Pulling market data..."):
+        close_prices = pull_price_data(all_tickers, lookback)
+        daily_returns = compute_daily_returns(close_prices)
+except RuntimeError:
+    st.error(
+        "Couldn't reach Yahoo Finance right now. This usually means Yahoo "
+        "is temporarily rate-limiting requests from this server (common on "
+        "shared cloud hosting) rather than a bug in the app. Click **Force "
+        "refresh data now** in the sidebar in a minute, or reload the page."
+    )
+    st.stop()
+
+if len(daily_returns) < 2:
+    st.error(
+        "Not enough trading days came back to compute returns. Try a "
+        "longer lookback period in the sidebar, or click **Force refresh "
+        "data now**."
+    )
+    st.stop()
 
 last_update = pd.Timestamp.now().strftime("%H:%M:%S")
 st.caption(
