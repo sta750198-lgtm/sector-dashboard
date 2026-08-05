@@ -39,6 +39,13 @@ DATA_REFRESH_SECONDS = 45
 SECTOR_COLORS = px.colors.qualitative.Vivid
 BENCHMARK_COLOR = "#FFFFFF"
 
+# How many trading days count as "normal" volume for a sector. Today's
+# volume divided by this rolling average is the "relative volume" - e.g.
+# 1.5x means today is trading 50% heavier than usual, which is the kind
+# of thing that tells you whether a correlation shift has real money
+# behind it or is just noise.
+VOLUME_AVG_WINDOW = 20
+
 # -----------------------------------------------------------------
 # PAGE CONFIG + DARK, "FINTECH" STYLED CSS
 # The .streamlit/config.toml file sets the base dark theme; this CSS
@@ -114,20 +121,23 @@ st_autorefresh(interval=DATA_REFRESH_SECONDS * 1000, key="auto_refresh_timer")
 # cumulative performance, turn returns into rolling correlation.
 # -----------------------------------------------------------------
 @st.cache_data(ttl=DATA_REFRESH_SECONDS)
-def pull_price_data(tickers, period):
+def pull_market_data(tickers, period):
     # Yahoo Finance occasionally rate-limits requests coming from shared
     # cloud hosts (like Streamlit Community Cloud) and silently returns an
     # empty table instead of an error. Retrying a couple of times with a
     # short pause clears this up almost every time; if it still fails we
     # raise so the caller can show a clear message instead of crashing on
     # a downstream "empty dataframe" error.
+    # One download gives us both price (Close) and Volume, so pulling
+    # volume for the flow/conviction chart doesn't cost a second API call.
     last_error = None
     for attempt in range(3):
         try:
             raw = yf.download(tickers, period=period, progress=False, threads=False)
             close_prices = raw["Close"]
+            volume = raw["Volume"]
             if not close_prices.empty and len(close_prices) > 5:
-                return close_prices
+                return close_prices, volume
         except Exception as exc:  # noqa: BLE001 - any failure just triggers a retry
             last_error = exc
         if attempt < 2:
@@ -155,6 +165,11 @@ def compute_rolling_correlation(daily_returns, window, benchmark):
             daily_returns[ticker].rolling(window).corr(daily_returns[benchmark])
         )
     return rolling_corr.dropna()
+
+
+def compute_relative_volume(volume, window):
+    average_volume = volume.rolling(window).mean()
+    return (volume / average_volume).dropna()
 
 
 def compute_correlation_shifts(rolling_corr, window):
@@ -241,6 +256,38 @@ def build_relative_strength_figure(cumulative_returns):
     return fig
 
 
+def build_volume_figure(relative_volume_latest):
+    # Sorted so the heaviest-trading sector is always on top - that's
+    # usually the one worth talking about first.
+    sorted_vals = relative_volume_latest.sort_values(ascending=True)
+
+    # Color by how far from "normal" (1.0x) each sector is trading:
+    # green for unusually heavy volume (money moving), gray for quiet,
+    # red for unusually light (nobody's trading it right now).
+    bar_colors = [
+        "#3DDC97" if v >= 1.2 else ("#E85D5D" if v <= 0.8 else "#5C6773")
+        for v in sorted_vals
+    ]
+
+    fig = go.Figure(go.Bar(
+        x=sorted_vals.values,
+        y=sorted_vals.index,
+        orientation="h",
+        marker_color=bar_colors,
+        hovertemplate="%{y}: %{x:.2f}x normal volume<extra></extra>",
+    ))
+    fig.add_vline(x=1.0, line_width=1.5, line_dash="dash", line_color="#AAAAAA")
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis_title=f"Volume vs {VOLUME_AVG_WINDOW}-day average",
+        margin=dict(l=10, r=10, t=10, b=10),
+        height=420,
+    )
+    return fig
+
+
 def build_rolling_corr_figure(rolling_corr, selected_sectors):
     fig = go.Figure()
     for i, sector in enumerate(selected_sectors):
@@ -320,7 +367,7 @@ labels = {**SECTOR_ETFS, BENCHMARK: "S&P 500 (SPY)"}
 
 try:
     with st.spinner("Pulling market data..."):
-        close_prices = pull_price_data(all_tickers, lookback)
+        close_prices, volume = pull_market_data(all_tickers, lookback)
         daily_returns = compute_daily_returns(close_prices)
 except RuntimeError:
     st.error(
@@ -362,18 +409,37 @@ corr_matrix = renamed_returns.corr()
 rolling_corr_raw = compute_rolling_correlation(daily_returns, rolling_window, BENCHMARK)
 rolling_corr = rolling_corr_raw.rename(columns=labels)
 
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+renamed_volume = volume.rename(columns=labels)
+relative_volume = compute_relative_volume(renamed_volume, VOLUME_AVG_WINDOW)
+has_volume_data = len(relative_volume) > 0
+if has_volume_data:
+    relative_volume_latest = relative_volume.iloc[-1]
+    most_active_sector = relative_volume_latest.drop("S&P 500 (SPY)").idxmax()
+
+kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
 kpi1.metric("Leading Sector", top_sector, f"{sector_only_returns.iloc[0]:+.1%}")
 kpi2.metric("Lagging Sector", bottom_sector, f"{sector_only_returns.iloc[-1]:+.1%}")
 kpi3.metric("S&P 500 (SPY)", f"{final_returns['S&P 500 (SPY)']:+.1%}", "benchmark")
 
 if len(rolling_corr) > rolling_window and selected_sectors:
     shifts_df = compute_correlation_shifts(rolling_corr, rolling_window)
+    if has_volume_data:
+        shifts_df["Rel. Volume"] = shifts_df["Sector"].map(
+            lambda s: round(relative_volume_latest.get(s, float("nan")), 2)
+        )
     n_flips = int(shifts_df["Sign Flip"].sum())
     kpi4.metric("Correlation Sign Flips", n_flips, "vs SPY" if n_flips else "none")
 else:
     shifts_df = None
     kpi4.metric("Correlation Sign Flips", "-")
+
+if has_volume_data:
+    kpi5.metric(
+        "Most Active Sector", most_active_sector,
+        f"{relative_volume_latest[most_active_sector]:.1f}x normal volume",
+    )
+else:
+    kpi5.metric("Most Active Sector", "-")
 
 st.divider()
 
@@ -382,6 +448,28 @@ st.divider()
 # -----------------------------------------------------------------
 st.subheader("Relative Strength")
 st.plotly_chart(build_relative_strength_figure(renamed_cumulative), width='stretch')
+
+st.divider()
+
+# -----------------------------------------------------------------
+# VOLUME / FLOW (interactive)
+# Correlation tells you a sector moved with or against the market;
+# this tells you whether real money was behind that move, or if it
+# was just quiet drift.
+# -----------------------------------------------------------------
+st.subheader("Volume / Flow")
+st.caption(
+    f"Today's volume vs each sector's {VOLUME_AVG_WINDOW}-day average - "
+    "how much conviction is behind the current move."
+)
+if has_volume_data:
+    volume_to_plot = relative_volume_latest.drop("S&P 500 (SPY)")
+    st.plotly_chart(build_volume_figure(volume_to_plot), width='stretch')
+else:
+    st.info(
+        f"Need more than {VOLUME_AVG_WINDOW} trading days of history to "
+        "compute relative volume - try a longer lookback period."
+    )
 
 st.divider()
 
